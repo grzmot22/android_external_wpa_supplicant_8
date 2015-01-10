@@ -26,6 +26,8 @@ L_CFLAGS += -DCONFIG_CTRL_IFACE_CLIENT_DIR=\"/data/misc/wifi/sockets\"
 L_CFLAGS += -DLIBXML_SCHEMAS_ENABLED
 L_CFLAGS += -DLIBXML_REGEXP_ENABLED
 
+L_CFLAGS += -Os
+
 OBJS = spp_client.c
 OBJS += oma_dm_client.c
 OBJS += osu_client.c
