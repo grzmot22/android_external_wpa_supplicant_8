@@ -1501,6 +1501,7 @@ static void mlme_event_connect(struct wpa_driver_nl80211_data *drv,
 			       struct nlattr *resp_ie)
 {
 	union wpa_event_data event;
+	u16 status_code;
 
 	if (drv->capa.flags & WPA_DRIVER_FLAGS_SME) {
 		/*
@@ -1512,21 +1513,41 @@ static void mlme_event_connect(struct wpa_driver_nl80211_data *drv,
 		return;
 	}
 
-	if (cmd == NL80211_CMD_CONNECT)
-		wpa_printf(MSG_DEBUG, "nl80211: Connect event");
-	else if (cmd == NL80211_CMD_ROAM)
+	status_code = status ? nla_get_u16(status) : WLAN_STATUS_SUCCESS;
+
+	if (cmd == NL80211_CMD_CONNECT) {
+		wpa_printf(MSG_DEBUG,
+			   "nl80211: Connect event (status=%u ignore_next_local_disconnect=%d)",
+			   status_code, drv->ignore_next_local_disconnect);
+	} else if (cmd == NL80211_CMD_ROAM) {
 		wpa_printf(MSG_DEBUG, "nl80211: Roam event");
+	}
 
 	os_memset(&event, 0, sizeof(event));
-	if (cmd == NL80211_CMD_CONNECT &&
-	    nla_get_u16(status) != WLAN_STATUS_SUCCESS) {
+	if (cmd == NL80211_CMD_CONNECT && status_code != WLAN_STATUS_SUCCESS) {
 		if (addr)
 			event.assoc_reject.bssid = nla_data(addr);
+		if (drv->ignore_next_local_disconnect) {
+			drv->ignore_next_local_disconnect = 0;
+			if (!event.assoc_reject.bssid ||
+			    (os_memcmp(event.assoc_reject.bssid,
+				       drv->auth_attempt_bssid,
+				       ETH_ALEN) != 0)) {
+				/*
+				 * Ignore the event that came without a BSSID or
+				 * for the old connection since this is likely
+				 * not relevant to the new Connect command.
+				 */
+				wpa_printf(MSG_DEBUG,
+					   "nl80211: Ignore connection failure event triggered during reassociation");
+				return;
+			}
+		}
 		if (resp_ie) {
 			event.assoc_reject.resp_ies = nla_data(resp_ie);
 			event.assoc_reject.resp_ies_len = nla_len(resp_ie);
 		}
-		event.assoc_reject.status_code = nla_get_u16(status);
+		event.assoc_reject.status_code = status_code;
 		wpa_supplicant_event(drv->ctx, EVENT_ASSOC_REJECT, &event);
 		return;
 	}
@@ -2866,12 +2887,42 @@ static void qca_nl80211_avoid_freq(struct wpa_driver_nl80211_data *drv,
 }
 
 
+static void qca_nl80211_acs_select_ch(struct wpa_driver_nl80211_data *drv,
+				   const u8 *data, size_t len)
+{
+	struct nlattr *tb[QCA_WLAN_VENDOR_ATTR_ACS_MAX + 1];
+	union wpa_event_data event;
+
+	wpa_printf(MSG_DEBUG,
+		   "nl80211: ACS channel selection vendor event received");
+
+	if (nla_parse(tb, QCA_WLAN_VENDOR_ATTR_ACS_MAX,
+		      (struct nlattr *) data, len, NULL))
+		return;
+
+	if (!tb[QCA_WLAN_VENDOR_ATTR_ACS_PRIMARY_CHANNEL] ||
+	    !tb[QCA_WLAN_VENDOR_ATTR_ACS_SECONDARY_CHANNEL])
+		return;
+
+	os_memset(&event, 0, sizeof(event));
+	event.acs_selected_channels.pri_channel =
+		nla_get_u8(tb[QCA_WLAN_VENDOR_ATTR_ACS_PRIMARY_CHANNEL]);
+	event.acs_selected_channels.sec_channel =
+		nla_get_u8(tb[QCA_WLAN_VENDOR_ATTR_ACS_SECONDARY_CHANNEL]);
+
+	wpa_supplicant_event(drv->ctx, EVENT_ACS_CHANNEL_SELECTED, &event);
+}
+
+
 static void nl80211_vendor_event_qca(struct wpa_driver_nl80211_data *drv,
 				     u32 subcmd, u8 *data, size_t len)
 {
 	switch (subcmd) {
 	case QCA_NL80211_VENDOR_SUBCMD_AVOID_FREQUENCY:
 		qca_nl80211_avoid_freq(drv, data, len);
+		break;
+	case QCA_NL80211_VENDOR_SUBCMD_DO_ACS:
+		qca_nl80211_acs_select_ch(drv, data, len);
 		break;
 	default:
 		wpa_printf(MSG_DEBUG,
@@ -3945,6 +3996,9 @@ static int wiphy_info_handler(struct nl_msg *msg, void *arg)
 			if (vinfo->subcmd ==
 			    QCA_NL80211_VENDOR_SUBCMD_DFS_CAPABILITY)
 				drv->dfs_vendor_cmd_avail = 1;
+			if (vinfo->subcmd ==
+			    QCA_NL80211_VENDOR_SUBCMD_DO_ACS)
+				drv->capa.flags |= WPA_DRIVER_FLAGS_ACS_OFFLOAD;
 
 			wpa_printf(MSG_DEBUG, "nl80211: Supported vendor command: vendor_id=0x%x subcmd=%u",
 				   vinfo->vendor_id, vinfo->subcmd);
@@ -9129,7 +9183,15 @@ static int wpa_driver_nl80211_connect(
 	struct wpa_driver_nl80211_data *drv,
 	struct wpa_driver_associate_params *params)
 {
-	int ret = wpa_driver_nl80211_try_connect(drv, params);
+	int ret;
+
+	/* Store the connection attempted bssid for future use */
+	if (params->bssid)
+		os_memcpy(drv->auth_attempt_bssid, params->bssid, ETH_ALEN);
+	else
+		os_memset(drv->auth_attempt_bssid, 0, ETH_ALEN);
+
+	ret = wpa_driver_nl80211_try_connect(drv, params);
 	if (ret == -EALREADY) {
 		/*
 		 * cfg80211 does not currently accept new connections if
@@ -12593,6 +12655,71 @@ nla_put_failure:
 }
 
 
+static int hw_mode_to_qca_acs(enum hostapd_hw_mode hw_mode)
+{
+	switch (hw_mode) {
+	case HOSTAPD_MODE_IEEE80211B:
+		return QCA_ACS_MODE_IEEE80211B;
+	case HOSTAPD_MODE_IEEE80211G:
+		return QCA_ACS_MODE_IEEE80211G;
+	case HOSTAPD_MODE_IEEE80211A:
+		return QCA_ACS_MODE_IEEE80211A;
+	case HOSTAPD_MODE_IEEE80211AD:
+		return QCA_ACS_MODE_IEEE80211AD;
+	default:
+		return -1;
+	}
+}
+
+
+static int wpa_driver_do_acs(void *priv, struct drv_acs_params *params)
+{
+	struct i802_bss *bss = priv;
+	struct wpa_driver_nl80211_data *drv = bss->drv;
+	struct nl_msg *msg;
+	struct nlattr *data;
+	int ret = -ENOBUFS;
+	int mode;
+
+	mode = hw_mode_to_qca_acs(params->hw_mode);
+	if (mode < 0)
+		return -1;
+
+	msg = nlmsg_alloc();
+	if (!msg)
+		return -1;
+
+	nl80211_cmd(drv, msg, 0, NL80211_CMD_VENDOR);
+
+	NLA_PUT_U32(msg, NL80211_ATTR_IFINDEX, drv->ifindex);
+	NLA_PUT_U32(msg, NL80211_ATTR_VENDOR_ID, OUI_QCA);
+	NLA_PUT_U32(msg, NL80211_ATTR_VENDOR_SUBCMD,
+		    QCA_NL80211_VENDOR_SUBCMD_DO_ACS);
+
+	data = nla_nest_start(msg, NL80211_ATTR_VENDOR_DATA);
+	if (!data)
+		goto nla_put_failure;
+	NLA_PUT_U8(msg, QCA_WLAN_VENDOR_ATTR_ACS_HW_MODE, mode);
+	if (params->ht_enabled)
+		NLA_PUT_FLAG(msg, QCA_WLAN_VENDOR_ATTR_ACS_HT_ENABLED);
+	if (params->ht40_enabled)
+		NLA_PUT_FLAG(msg, QCA_WLAN_VENDOR_ATTR_ACS_HT40_ENABLED);
+	nla_nest_end(msg, data);
+
+	ret = send_and_recv_msgs(drv, msg, NULL, NULL);
+	msg = NULL;
+	if (ret) {
+		wpa_printf(MSG_DEBUG,
+			   "nl80211: Failed to invoke driver ACS function: %s",
+			   strerror(errno));
+	}
+
+nla_put_failure:
+	nlmsg_free(msg);
+	return ret;
+}
+
+
 const struct wpa_driver_ops wpa_driver_nl80211_ops = {
 	.name = "nl80211",
 	.desc = "Linux nl80211/cfg80211",
@@ -12685,4 +12812,5 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
 	.set_qos_map = nl80211_set_qos_map,
 	.set_wowlan = nl80211_set_wowlan,
 	.key_mgmt_set_pmk = nl80211_key_mgmt_set_pmk,
+	.do_acs = wpa_driver_do_acs,
 };
