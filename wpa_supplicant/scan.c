@@ -1013,6 +1013,27 @@ ssid_list_set:
 		}
 	}
 
+	if (!is_zero_ether_addr(wpa_s->next_scan_bssid)) {
+		struct wpa_bss *bss;
+
+		params.bssid = wpa_s->next_scan_bssid;
+		bss = wpa_bss_get_bssid_latest(wpa_s, params.bssid);
+		if (bss && bss->ssid_len && params.num_ssids == 1 &&
+		    params.ssids[0].ssid_len == 0) {
+			params.ssids[0].ssid = bss->ssid;
+			params.ssids[0].ssid_len = bss->ssid_len;
+			wpa_dbg(wpa_s, MSG_DEBUG,
+				"Scan a previously specified BSSID " MACSTR
+				" and SSID %s",
+				MAC2STR(params.bssid),
+				wpa_ssid_txt(bss->ssid, bss->ssid_len));
+		} else {
+			wpa_dbg(wpa_s, MSG_DEBUG,
+				"Scan a previously specified BSSID " MACSTR,
+				MAC2STR(params.bssid));
+		}
+	}
+
 	scan_params = &params;
 
 scan:
@@ -1073,6 +1094,8 @@ scan:
 #ifdef CONFIG_INTERWORKING
 		wpa_s->interworking_fast_assoc_tried = 0;
 #endif /* CONFIG_INTERWORKING */
+		if (params.bssid)
+			os_memset(wpa_s->next_scan_bssid, 0, ETH_ALEN);
 	}
 }
 
@@ -1692,7 +1715,7 @@ static int wpa_scan_result_compar(const void *a, const void *b)
 		snr_a_full = wa->snr;
 		snr_a = MIN(wa->snr, GREAT_SNR);
 		snr_b_full = wb->snr;
-		snr_b = MIN(wa->snr, GREAT_SNR);
+		snr_b = MIN(wb->snr, GREAT_SNR);
 	} else {
 		/* Level is not in dBm, so we can't calculate
 		 * SNR. Just use raw level (units unknown). */
@@ -1836,8 +1859,8 @@ int wpa_supplicant_filter_bssid_match(struct wpa_supplicant *wpa_s,
 }
 
 
-static void filter_scan_res(struct wpa_supplicant *wpa_s,
-			    struct wpa_scan_results *res)
+void filter_scan_res(struct wpa_supplicant *wpa_s,
+		     struct wpa_scan_results *res)
 {
 	size_t i, j;
 
@@ -1870,7 +1893,7 @@ static void filter_scan_res(struct wpa_supplicant *wpa_s,
 #define DEFAULT_NOISE_FLOOR_2GHZ (-89)
 #define DEFAULT_NOISE_FLOOR_5GHZ (-92)
 
-static void scan_snr(struct wpa_scan_res *res)
+void scan_snr(struct wpa_scan_res *res)
 {
 	if (res->flags & WPA_SCAN_NOISE_INVALID) {
 		res->noise = IS_5GHZ(res->freq) ?
@@ -1954,8 +1977,8 @@ static unsigned int max_vht80_rate(int snr)
 }
 
 
-static void scan_est_throughput(struct wpa_supplicant *wpa_s,
-				struct wpa_scan_res *res)
+void scan_est_throughput(struct wpa_supplicant *wpa_s,
+			 struct wpa_scan_res *res)
 {
 	enum local_hw_capab capab = wpa_s->hw_capab;
 	int rate; /* max legacy rate in 500 kb/s units */
@@ -2235,6 +2258,17 @@ wpa_scan_clone_params(const struct wpa_driver_scan_params *src)
 			params->mac_addr_mask = mac_addr + ETH_ALEN;
 		}
 	}
+
+	if (src->bssid) {
+		u8 *bssid;
+
+		bssid = os_malloc(ETH_ALEN);
+		if (!bssid)
+			goto failed;
+		os_memcpy(bssid, src->bssid, ETH_ALEN);
+		params->bssid = bssid;
+	}
+
 	return params;
 
 failed:
@@ -2261,6 +2295,8 @@ void wpa_scan_free_params(struct wpa_driver_scan_params *params)
 	 * must not be freed separately.
 	 */
 	os_free((u8 *) params->mac_addr);
+
+	os_free((u8 *) params->bssid);
 
 	os_free(params);
 }
@@ -2464,5 +2500,16 @@ int wpas_mac_addr_rand_scan_set(struct wpa_supplicant *wpa_s,
 	}
 
 	wpa_s->mac_addr_rand_enable |= type;
+	return 0;
+}
+
+
+int wpas_abort_ongoing_scan(struct wpa_supplicant *wpa_s)
+{
+	if (wpa_s->scan_work && wpa_s->own_scan_running) {
+		wpa_dbg(wpa_s, MSG_DEBUG, "Abort an ongoing scan");
+		return wpa_drv_abort_scan(wpa_s);
+	}
+
 	return 0;
 }

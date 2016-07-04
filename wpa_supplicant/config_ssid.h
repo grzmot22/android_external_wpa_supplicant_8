@@ -358,6 +358,19 @@ struct wpa_ssid {
 	} mode;
 
 	/**
+	 * pbss - Whether to use PBSS. Relevant to DMG networks only.
+	 * 0 = do not use PBSS
+	 * 1 = use PBSS
+	 * 2 = don't care (not allowed in AP mode)
+	 * Used together with mode configuration. When mode is AP, it
+	 * means to start a PCP instead of a regular AP. When mode is INFRA it
+	 * means connect to a PCP instead of AP. In this mode you can also
+	 * specify 2 (don't care) meaning connect to either AP or PCP.
+	 * P2P_GO and P2P_GROUP_FORMATION modes must use PBSS in DMG network.
+	 */
+	int pbss;
+
+	/**
 	 * disabled - Whether this network is currently disabled
 	 *
 	 * 0 = this network can be used (default).
@@ -446,6 +459,10 @@ struct wpa_ssid {
 	int ht40;
 
 	int vht;
+
+	u8 max_oper_chwidth;
+
+	unsigned int vht_center_freq2;
 
 	/**
 	 * wpa_ptk_rekey - Maximum lifetime for PTK in seconds

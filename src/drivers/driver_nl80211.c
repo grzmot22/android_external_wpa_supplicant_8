@@ -3508,6 +3508,12 @@ static int wpa_driver_nl80211_set_ap(void *priv,
 	}
 #endif /* CONFIG_P2P */
 
+	if (params->pbss) {
+		wpa_printf(MSG_DEBUG, "nl80211: PBSS");
+		if (nla_put_flag(msg, NL80211_ATTR_PBSS))
+			goto fail;
+	}
+
 	ret = send_and_recv_msgs(drv, msg, NULL, NULL);
 	if (ret) {
 		wpa_printf(MSG_DEBUG, "nl80211: Beacon set failed: %d (%s)",
@@ -4666,6 +4672,12 @@ static int nl80211_connect_common(struct wpa_driver_nl80211_data *drv,
 	if (params->p2p)
 		wpa_printf(MSG_DEBUG, "  * P2P group");
 
+	if (params->pbss) {
+		wpa_printf(MSG_DEBUG, "  * PBSS");
+		if (nla_put_flag(msg, NL80211_ATTR_PBSS))
+			return -1;
+	}
+
 	return 0;
 }
 
@@ -5806,8 +5818,9 @@ static enum nl80211_iftype wpa_driver_nl80211_if_type(
 		return NL80211_IFTYPE_P2P_DEVICE;
 	case WPA_IF_MESH:
 		return NL80211_IFTYPE_MESH_POINT;
+	default:
+		return -1;
 	}
-	return -1;
 }
 
 
@@ -6154,6 +6167,20 @@ static int nl80211_send_frame_cmd(struct i802_bss *bss,
 
 		if (cookie_out)
 			*cookie_out = no_ack ? (u64) -1 : cookie;
+
+		if (drv->num_send_action_cookies == MAX_SEND_ACTION_COOKIES) {
+			wpa_printf(MSG_DEBUG,
+				   "nl80211: Drop oldest pending send action cookie 0x%llx",
+				   (long long unsigned int)
+				   drv->send_action_cookies[0]);
+			os_memmove(&drv->send_action_cookies[0],
+				   &drv->send_action_cookies[1],
+				   (MAX_SEND_ACTION_COOKIES - 1) *
+				   sizeof(u64));
+			drv->num_send_action_cookies--;
+		}
+		drv->send_action_cookies[drv->num_send_action_cookies] = cookie;
+		drv->num_send_action_cookies++;
 	}
 
 fail:
@@ -6208,17 +6235,16 @@ static int wpa_driver_nl80211_send_action(struct i802_bss *bss,
 }
 
 
-static void wpa_driver_nl80211_send_action_cancel_wait(void *priv)
+static void nl80211_frame_wait_cancel(struct i802_bss *bss, u64 cookie)
 {
-	struct i802_bss *bss = priv;
 	struct wpa_driver_nl80211_data *drv = bss->drv;
 	struct nl_msg *msg;
 	int ret;
 
 	wpa_printf(MSG_DEBUG, "nl80211: Cancel TX frame wait: cookie=0x%llx",
-		   (long long unsigned int) drv->send_action_cookie);
+		   (long long unsigned int) cookie);
 	if (!(msg = nl80211_cmd_msg(bss, 0, NL80211_CMD_FRAME_WAIT_CANCEL)) ||
-	    nla_put_u64(msg, NL80211_ATTR_COOKIE, drv->send_action_cookie)) {
+	    nla_put_u64(msg, NL80211_ATTR_COOKIE, cookie)) {
 		nlmsg_free(msg);
 		return;
 	}
@@ -6227,6 +6253,30 @@ static void wpa_driver_nl80211_send_action_cancel_wait(void *priv)
 	if (ret)
 		wpa_printf(MSG_DEBUG, "nl80211: wait cancel failed: ret=%d "
 			   "(%s)", ret, strerror(-ret));
+}
+
+
+static void wpa_driver_nl80211_send_action_cancel_wait(void *priv)
+{
+	struct i802_bss *bss = priv;
+	struct wpa_driver_nl80211_data *drv = bss->drv;
+	unsigned int i;
+	u64 cookie;
+
+	/* Cancel the last pending TX cookie */
+	nl80211_frame_wait_cancel(bss, drv->send_action_cookie);
+
+	/*
+	 * Cancel the other pending TX cookies, if any. This is needed since
+	 * the driver may keep a list of all pending offchannel TX operations
+	 * and free up the radio only once they have expired or cancelled.
+	 */
+	for (i = drv->num_send_action_cookies; i > 0; i--) {
+		cookie = drv->send_action_cookies[i - 1];
+		if (cookie != drv->send_action_cookie)
+			nl80211_frame_wait_cancel(bss, cookie);
+	}
+	drv->num_send_action_cookies = 0;
 }
 
 
@@ -7222,6 +7272,17 @@ static int driver_nl80211_scan2(void *priv,
 				struct wpa_driver_scan_params *params)
 {
 	struct i802_bss *bss = priv;
+	struct wpa_driver_nl80211_data *drv = bss->drv;
+
+	/*
+	 * Do a vendor specific scan if possible. If only_new_results is
+	 * set, do a normal scan since a kernel (cfg80211) BSS cache flush
+	 * cannot be achieved through a vendor scan. The below condition may
+	 * need to be modified if new scan flags are added in the future whose
+	 * functionality can only be achieved through a normal scan.
+	 */
+	if (drv->scan_vendor_cmd_avail && !params->only_new_results)
+		return wpa_driver_nl80211_vendor_scan(bss, params);
 	return wpa_driver_nl80211_scan(bss, params);
 }
 
@@ -7490,7 +7551,10 @@ static int wpa_driver_nl80211_status(void *priv, char *buf, size_t buflen)
 				  "capa.max_acl_mac_addrs=%u\n"
 				  "capa.num_multichan_concurrent=%u\n"
 				  "capa.mac_addr_rand_sched_scan_supported=%d\n"
-				  "capa.mac_addr_rand_scan_supported=%d\n",
+				  "capa.mac_addr_rand_scan_supported=%d\n"
+				  "capa.conc_capab=%u\n"
+				  "capa.max_conc_chan_2_4=%u\n"
+				  "capa.max_conc_chan_5_0=%u\n",
 				  drv->capa.key_mgmt,
 				  drv->capa.enc,
 				  drv->capa.auth,
@@ -7506,7 +7570,10 @@ static int wpa_driver_nl80211_status(void *priv, char *buf, size_t buflen)
 				  drv->capa.max_acl_mac_addrs,
 				  drv->capa.num_multichan_concurrent,
 				  drv->capa.mac_addr_rand_sched_scan_supported,
-				  drv->capa.mac_addr_rand_scan_supported);
+				  drv->capa.mac_addr_rand_scan_supported,
+				  drv->capa.conc_capab,
+				  drv->capa.max_conc_chan_2_4,
+				  drv->capa.max_conc_chan_5_0);
 		if (os_snprintf_error(end - pos, res))
 			return pos - buf;
 		pos += res;
@@ -8387,6 +8454,26 @@ static int hw_mode_to_qca_acs(enum hostapd_hw_mode hw_mode)
 }
 
 
+static int add_acs_freq_list(struct nl_msg *msg, const int *freq_list)
+{
+	int i, len, ret;
+	u32 *freqs;
+
+	if (!freq_list)
+		return 0;
+	len = int_array_len(freq_list);
+	freqs = os_malloc(sizeof(u32) * len);
+	if (!freqs)
+		return -1;
+	for (i = 0; i < len; i++)
+		freqs[i] = freq_list[i];
+	ret = nla_put(msg, QCA_WLAN_VENDOR_ATTR_ACS_FREQ_LIST,
+		      sizeof(u32) * len, freqs);
+	os_free(freqs);
+	return ret;
+}
+
+
 static int wpa_driver_do_acs(void *priv, struct drv_acs_params *params)
 {
 	struct i802_bss *bss = priv;
@@ -8416,7 +8503,8 @@ static int wpa_driver_do_acs(void *priv, struct drv_acs_params *params)
 			params->ch_width) ||
 	    (params->ch_list_len &&
 	     nla_put(msg, QCA_WLAN_VENDOR_ATTR_ACS_CH_LIST, params->ch_list_len,
-		     params->ch_list))) {
+		     params->ch_list)) ||
+	    add_acs_freq_list(msg, params->freq_list)) {
 		nlmsg_free(msg);
 		return -ENOBUFS;
 	}
@@ -8434,6 +8522,193 @@ static int wpa_driver_do_acs(void *priv, struct drv_acs_params *params)
 			   strerror(errno));
 	}
 	return ret;
+}
+
+
+struct nl80211_pcl {
+	unsigned int num;
+	unsigned int *freq_list;
+};
+
+static int preferred_freq_info_handler(struct nl_msg *msg, void *arg)
+{
+	struct nlattr *tb[NL80211_ATTR_MAX + 1];
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct nl80211_pcl *param = arg;
+	struct nlattr *nl_vend, *attr;
+	enum qca_iface_type iface_type;
+	struct nlattr *tb_vendor[QCA_WLAN_VENDOR_ATTR_MAX + 1];
+	unsigned int num, max_num;
+	u32 *freqs;
+
+	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+		  genlmsg_attrlen(gnlh, 0), NULL);
+
+	nl_vend = tb[NL80211_ATTR_VENDOR_DATA];
+	if (!nl_vend)
+		return NL_SKIP;
+
+	nla_parse(tb_vendor, QCA_WLAN_VENDOR_ATTR_MAX,
+		  nla_data(nl_vend), nla_len(nl_vend), NULL);
+
+	attr = tb_vendor[
+		QCA_WLAN_VENDOR_ATTR_GET_PREFERRED_FREQ_LIST_IFACE_TYPE];
+	if (!attr) {
+		wpa_printf(MSG_ERROR, "nl80211: iface_type couldn't be found");
+		param->num = 0;
+		return NL_SKIP;
+	}
+
+	iface_type = (enum qca_iface_type) nla_get_u32(attr);
+	wpa_printf(MSG_DEBUG, "nl80211: Driver returned iface_type=%d",
+		   iface_type);
+
+	attr = tb_vendor[QCA_WLAN_VENDOR_ATTR_GET_PREFERRED_FREQ_LIST];
+	if (!attr) {
+		wpa_printf(MSG_ERROR,
+			   "nl80211: preferred_freq_list couldn't be found");
+		param->num = 0;
+		return NL_SKIP;
+	}
+
+	/*
+	 * param->num has the maximum number of entries for which there
+	 * is room in the freq_list provided by the caller.
+	 */
+	freqs = nla_data(attr);
+	max_num = nla_len(attr) / sizeof(u32);
+	if (max_num > param->num)
+		max_num = param->num;
+	for (num = 0; num < max_num; num++)
+		param->freq_list[num] = freqs[num];
+	param->num = num;
+
+	return NL_SKIP;
+}
+
+
+static int nl80211_get_pref_freq_list(void *priv,
+				      enum wpa_driver_if_type if_type,
+				      unsigned int *num,
+				      unsigned int *freq_list)
+{
+	struct i802_bss *bss = priv;
+	struct wpa_driver_nl80211_data *drv = bss->drv;
+	struct nl_msg *msg;
+	int ret;
+	unsigned int i;
+	struct nlattr *params;
+	struct nl80211_pcl param;
+	enum qca_iface_type iface_type;
+
+	if (!drv->get_pref_freq_list)
+		return -1;
+
+	switch (if_type) {
+	case WPA_IF_STATION:
+		iface_type = QCA_IFACE_TYPE_STA;
+		break;
+	case WPA_IF_AP_BSS:
+		iface_type = QCA_IFACE_TYPE_AP;
+		break;
+	case WPA_IF_P2P_GO:
+		iface_type = QCA_IFACE_TYPE_P2P_GO;
+		break;
+	case WPA_IF_P2P_CLIENT:
+		iface_type = QCA_IFACE_TYPE_P2P_CLIENT;
+		break;
+	case WPA_IF_IBSS:
+		iface_type = QCA_IFACE_TYPE_IBSS;
+		break;
+	case WPA_IF_TDLS:
+		iface_type = QCA_IFACE_TYPE_TDLS;
+		break;
+	default:
+		return -1;
+	}
+
+	param.num = *num;
+	param.freq_list = freq_list;
+
+	if (!(msg = nl80211_drv_msg(drv, 0, NL80211_CMD_VENDOR)) ||
+	    nla_put_u32(msg, NL80211_ATTR_IFINDEX, drv->ifindex) ||
+	    nla_put_u32(msg, NL80211_ATTR_VENDOR_ID, OUI_QCA) ||
+	    nla_put_u32(msg, NL80211_ATTR_VENDOR_SUBCMD,
+			QCA_NL80211_VENDOR_SUBCMD_GET_PREFERRED_FREQ_LIST) ||
+	    !(params = nla_nest_start(msg, NL80211_ATTR_VENDOR_DATA)) ||
+	    nla_put_u32(msg,
+			QCA_WLAN_VENDOR_ATTR_GET_PREFERRED_FREQ_LIST_IFACE_TYPE,
+			iface_type)) {
+		wpa_printf(MSG_ERROR,
+			   "%s: err in adding vendor_cmd and vendor_data",
+			   __func__);
+		nlmsg_free(msg);
+		return -1;
+	}
+	nla_nest_end(msg, params);
+
+	os_memset(freq_list, 0, *num * sizeof(freq_list[0]));
+	ret = send_and_recv_msgs(drv, msg, preferred_freq_info_handler, &param);
+	if (ret) {
+		wpa_printf(MSG_ERROR,
+			   "%s: err in send_and_recv_msgs", __func__);
+		return ret;
+	}
+
+	*num = param.num;
+
+	for (i = 0; i < *num; i++) {
+		wpa_printf(MSG_DEBUG, "nl80211: preferred_channel_list[%d]=%d",
+			   i, freq_list[i]);
+	}
+
+	return 0;
+}
+
+
+static int nl80211_set_prob_oper_freq(void *priv, unsigned int freq)
+{
+	struct i802_bss *bss = priv;
+	struct wpa_driver_nl80211_data *drv = bss->drv;
+	struct nl_msg *msg;
+	int ret;
+	struct nlattr *params;
+
+	if (!drv->set_prob_oper_freq)
+		return -1;
+
+	wpa_printf(MSG_DEBUG,
+		   "nl80211: Set P2P probable operating freq %u for ifindex %d",
+		   freq, bss->ifindex);
+
+	if (!(msg = nl80211_drv_msg(drv, 0, NL80211_CMD_VENDOR)) ||
+	    nla_put_u32(msg, NL80211_ATTR_VENDOR_ID, OUI_QCA) ||
+	    nla_put_u32(msg, NL80211_ATTR_VENDOR_SUBCMD,
+			QCA_NL80211_VENDOR_SUBCMD_SET_PROBABLE_OPER_CHANNEL) ||
+	    !(params = nla_nest_start(msg, NL80211_ATTR_VENDOR_DATA)) ||
+	    nla_put_u32(msg,
+			QCA_WLAN_VENDOR_ATTR_PROBABLE_OPER_CHANNEL_IFACE_TYPE,
+			QCA_IFACE_TYPE_P2P_CLIENT) ||
+	    nla_put_u32(msg,
+			QCA_WLAN_VENDOR_ATTR_PROBABLE_OPER_CHANNEL_FREQ,
+			freq)) {
+		wpa_printf(MSG_ERROR,
+			   "%s: err in adding vendor_cmd and vendor_data",
+			   __func__);
+		nlmsg_free(msg);
+		return -1;
+	}
+	nla_nest_end(msg, params);
+
+	ret = send_and_recv_msgs(drv, msg, NULL, NULL);
+	msg = NULL;
+	if (ret) {
+		wpa_printf(MSG_ERROR, "%s: err in send_and_recv_msgs",
+			   __func__);
+		return ret;
+	}
+	nlmsg_free(msg);
+	return 0;
 }
 
 
@@ -8494,6 +8769,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
 	.sched_scan = wpa_driver_nl80211_sched_scan,
 	.stop_sched_scan = wpa_driver_nl80211_stop_sched_scan,
 	.get_scan_results2 = wpa_driver_nl80211_get_scan_results,
+	.abort_scan = wpa_driver_nl80211_abort_scan,
 	.deauthenticate = driver_nl80211_deauthenticate,
 	.authenticate = driver_nl80211_authenticate,
 	.associate = wpa_driver_nl80211_associate,
@@ -8592,4 +8868,6 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
 	.del_tx_ts = nl80211_del_ts,
 	.do_acs = wpa_driver_do_acs,
 	.set_band = nl80211_set_band,
+	.get_pref_freq_list = nl80211_get_pref_freq_list,
+	.set_prob_oper_freq = nl80211_set_prob_oper_freq,
 };

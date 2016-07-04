@@ -10,6 +10,7 @@
 
 #include "common.h"
 #include "eloop.h"
+#include "common/defs.h"
 #include "common/ieee802_11_defs.h"
 #include "common/ieee802_11_common.h"
 #include "common/wpa_ctrl.h"
@@ -3433,7 +3434,8 @@ void p2p_scan_res_handled(struct p2p_data *p2p)
 }
 
 
-void p2p_scan_ie(struct p2p_data *p2p, struct wpabuf *ies, const u8 *dev_id)
+void p2p_scan_ie(struct p2p_data *p2p, struct wpabuf *ies, const u8 *dev_id,
+		 unsigned int bands)
 {
 	u8 dev_capab;
 	u8 *len;
@@ -3466,6 +3468,9 @@ void p2p_scan_ie(struct p2p_data *p2p, struct wpabuf *ies, const u8 *dev_id)
 	if (p2p->ext_listen_interval)
 		p2p_buf_add_ext_listen_timing(ies, p2p->ext_listen_period,
 					      p2p->ext_listen_interval);
+
+	if (bands & BAND_60_GHZ)
+		p2p_buf_add_device_info(ies, p2p, NULL);
 
 	if (p2p->p2ps_seek && p2p->p2ps_seek_count)
 		p2p_buf_add_service_hash(ies, p2p);
@@ -5389,4 +5394,21 @@ void p2p_go_neg_wait_timeout(void *eloop_ctx, void *timeout_ctx)
 	p2p_dbg(p2p,
 		"Timeout on waiting peer to become ready for GO Negotiation");
 	p2p_go_neg_failed(p2p, -1);
+}
+
+
+void p2p_set_own_pref_freq_list(struct p2p_data *p2p,
+				const unsigned int *pref_freq_list,
+				unsigned int size)
+{
+	unsigned int i;
+
+	if (size > P2P_MAX_PREF_CHANNELS)
+		size = P2P_MAX_PREF_CHANNELS;
+	p2p->num_pref_freq = size;
+	for (i = 0; i < size; i++) {
+		p2p->pref_freq_list[i] = pref_freq_list[i];
+		p2p_dbg(p2p, "Own preferred frequency list[%u]=%u MHz",
+			i, p2p->pref_freq_list[i]);
+	}
 }

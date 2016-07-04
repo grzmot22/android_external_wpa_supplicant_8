@@ -1543,7 +1543,7 @@ static const char *network_fields[] = {
 	"ssid", "scan_ssid", "bssid", "bssid_blacklist",
 	"bssid_whitelist", "psk", "proto", "key_mgmt",
 	"bg_scan_period", "pairwise", "group", "auth_alg", "scan_freq",
-	"freq_list",
+	"freq_list", "max_oper_chwidth",
 #ifdef IEEE8021X_EAPOL
 	"eap", "identity", "anonymous_identity", "password", "ca_cert",
 	"ca_path", "client_cert", "private_key", "private_key_passwd",
@@ -1601,7 +1601,7 @@ static const char *network_fields[] = {
 #ifdef CONFIG_HS20
 	"update_identifier",
 #endif /* CONFIG_HS20 */
-	"mac_addr"
+	"mac_addr", "pbss"
 };
 
 
@@ -1756,6 +1756,13 @@ static int wpa_cli_cmd_scan_results(struct wpa_ctrl *ctrl, int argc,
 				    char *argv[])
 {
 	return wpa_ctrl_command(ctrl, "SCAN_RESULTS");
+}
+
+
+static int wpa_cli_cmd_abort_scan(struct wpa_ctrl *ctrl, int argc,
+				  char *argv[])
+{
+	return wpa_ctrl_command(ctrl, "ABORT_SCAN");
 }
 
 
@@ -2811,6 +2818,13 @@ static int wpa_cli_cmd_mac_rand_scan(struct wpa_ctrl *ctrl, int argc,
 }
 
 
+static int wpa_cli_cmd_get_pref_freq_list(struct wpa_ctrl *ctrl, int argc,
+					  char *argv[])
+{
+	return wpa_cli_cmd(ctrl, "GET_PREF_FREQ_LIST", 1, argc, argv);
+}
+
+
 enum wpa_cli_cmd_flags {
 	cli_cmd_flag_none		= 0x00,
 	cli_cmd_flag_sensitive		= 0x01
@@ -2989,6 +3003,9 @@ static const struct wpa_cli_cmd wpa_cli_commands[] = {
 	{ "scan_results", wpa_cli_cmd_scan_results, NULL,
 	  cli_cmd_flag_none,
 	  "= get latest scan results" },
+	{ "abort_scan", wpa_cli_cmd_abort_scan, NULL,
+	  cli_cmd_flag_none,
+	  "= request ongoing scan to be aborted" },
 	{ "bss", wpa_cli_cmd_bss, wpa_cli_complete_bss,
 	  cli_cmd_flag_none,
 	  "<<idx> | <bssid>> = get detailed scan result info" },
@@ -3365,6 +3382,9 @@ static const struct wpa_cli_cmd wpa_cli_commands[] = {
 	  "<scan|sched|pno|all> enable=<0/1> [addr=mac-address "
 	  "mask=mac-address-mask] = scan MAC randomization"
 	},
+	{ "get_pref_freq_list", wpa_cli_cmd_get_pref_freq_list, NULL,
+	  cli_cmd_flag_none,
+	  "<interface type> = retrieve preferred freq list for the specified interface type" },
 	{ NULL, NULL, NULL, cli_cmd_flag_none, NULL }
 };
 
